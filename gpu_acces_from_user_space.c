@@ -10,18 +10,15 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <inttypes.h>
-#include <limits.h>
 
 #include <drm/drm.h>      // syncobj UAPI
-#include <drm/xe_drm.h>   // Xe UAPI (libdrm with xe support, or kernel uapi)
+#include <drm/xe_drm.h>   // Xe UAPI
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
 
-/* Base size; actual BO size will be max(BASE_BO_SIZE, min_page_size) */
-#define BASE_BO_SIZE   4096
-
+#define BO_SIZE        4096
 #define BIND_ADDRESS   0x1000000ull   /* arbitrary GPU VA, page aligned */
 
 /* MI_BATCH_BUFFER_END: opcode 0x0A in bits 31:23 */
@@ -84,7 +81,6 @@ pick_render_engine(int fd)
 
 /*
  * Query memory regions and return a placement mask for SYSMEM.
- * Also returns the maximum min_page_size among those regions.
  */
 static uint32_t pick_sysmem_placement(int fd, uint32_t *min_page_size_out)
 {
@@ -108,13 +104,13 @@ static uint32_t pick_sysmem_placement(int fd, uint32_t *min_page_size_out)
         die("DRM_IOCTL_XE_DEVICE_QUERY (MEM_REGIONS)");
 
     uint32_t placement = 0;
-    /* Start with 4K, then we take the max of r->min_page_size among SYSMEM */
     uint32_t min_page_size = 4096;
 
     for (uint32_t i = 0; i < mem->num_mem_regions; i++) {
         struct drm_xe_mem_region *r = &mem->mem_regions[i];
 
         if (r->mem_class == DRM_XE_MEM_REGION_CLASS_SYSMEM) {
+            /* placement bit = region instance (per UAPI docs) */
             placement |= (1u << r->instance);
             if (r->min_page_size > min_page_size)
                 min_page_size = r->min_page_size;
@@ -124,7 +120,8 @@ static uint32_t pick_sysmem_placement(int fd, uint32_t *min_page_size_out)
     free(mem);
 
     if (!placement) {
-        fprintf(stderr, "No SYSMEM region found; placement=0 (may fail)\n");
+        fprintf(stderr,
+                "No SYSMEM region found; placement=0 (GEM_CREATE may fail)\n");
     }
 
     *min_page_size_out = min_page_size;
@@ -195,19 +192,17 @@ int main(int argc, char **argv)
     uint32_t min_page_size = 0;
     uint32_t placement = pick_sysmem_placement(fd, &min_page_size);
 
-    printf("SYSMEM placement mask = 0x%08x, min_page_size = %u\n",
-           placement, min_page_size);
-
     if (!placement) {
-        fprintf(stderr, "WARNING: placement mask is 0, GEM_CREATE may fail\n");
+        fprintf(stderr,
+                "WARNING: placement mask is 0, GEM_CREATE may fail\n");
     }
 
-    /* Ensure BO size respects min_page_size */
-    uint64_t bo_size = BASE_BO_SIZE;
-    if (min_page_size > bo_size)
-        bo_size = min_page_size;
+    /* Make BO size aligned to min_page_size just to be safe */
+    if (min_page_size < 4096)
+        min_page_size = 4096;
 
-    printf("Using bo_size = %" PRIu64 " bytes\n", bo_size);
+    uint64_t bo_size = (BO_SIZE + min_page_size - 1) &
+                       ~(uint64_t)(min_page_size - 1);
 
     /* 3) Create GEM buffer attached to this VM */
     struct drm_xe_gem_create gcreate = {
@@ -224,6 +219,7 @@ int main(int argc, char **argv)
         die("DRM_IOCTL_XE_GEM_CREATE");
 
     uint32_t bo_handle = gcreate.handle;
+    bo_size = gcreate.size;   /* in case driver rounded up */
     printf("GEM BO created: handle=%u, size=%" PRIu64 "\n",
            bo_handle, (uint64_t)gcreate.size);
 
@@ -246,14 +242,9 @@ int main(int argc, char **argv)
     printf("BO mapped at %p\n", map);
 
     /* 5) Write a tiny batch: just MI_BATCH_BUFFER_END */
-    {
-        uint32_t *batch = (uint32_t *)map;
-        batch[0] = MI_BATCH_BUFFER_END;
-        batch[1] = 0;   /* padding / NOOP */
-        /* Not strictly required, but keeps things explicit */
-        if (msync(map, bo_size, MS_SYNC) != 0)
-            perror("msync");
-    }
+    uint32_t *batch = (uint32_t *)map;
+    batch[0] = MI_BATCH_BUFFER_END;
+    batch[1] = 0;   /* padding / NOOP */
 
     /* 6) Create syncobj for EXEC out-fence */
     uint32_t sync_handle = create_syncobj(fd);
@@ -269,9 +260,10 @@ int main(int argc, char **argv)
     struct drm_xe_vm_bind bind = {
         .extensions    = 0,
         .vm_id         = vm_id,
-        .exec_queue_id = 0,      /* default VM-bind engine */
+        .exec_queue_id = 0,      /* default VM-bind engine (sync) */
         .pad           = 0,
         .num_binds     = 1,
+        .pad2          = 0,
         .num_syncs     = 0,      /* syncs only for ASYNC bind */
         .syncs         = 0,
     };
@@ -337,17 +329,6 @@ int main(int argc, char **argv)
 
     /* Minimal cleanup; kernel will clean everything on close(fd) anyway */
     munmap(map, bo_size);
-
-    /* Optional: destroy syncobj (not strictly necessary if closing fd) */
-    struct drm_syncobj_destroy destroy = {
-        .handle = sync_handle,
-        .pad    = 0,
-    };
-    if (ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy) < 0) {
-        /* Not fatal, just log */
-        perror("DRM_IOCTL_SYNCOBJ_DESTROY");
-    }
-
     close(fd);
 
     return 0;
