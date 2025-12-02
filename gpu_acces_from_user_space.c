@@ -1,3 +1,7 @@
+/* 
+ * Copyright (c) 2025, sparkmon <dev@sparkmon.com>
+ * All rights reserved.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
