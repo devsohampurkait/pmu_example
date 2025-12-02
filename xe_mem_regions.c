@@ -9,7 +9,7 @@
 #include <sys/ioctl.h>
 #include <inttypes.h>
 
-#include <drm/xe_drm.h>   /* make sure this matches your running kernel */
+#include <drm/xe_drm.h>
 
 static void die(const char *msg)
 {
@@ -32,7 +32,6 @@ static const char *mem_class_name(uint16_t cls)
     switch (cls) {
     case DRM_XE_MEM_REGION_CLASS_SYSMEM: return "SYSMEM";
     case DRM_XE_MEM_REGION_CLASS_VRAM:   return "VRAM";
-    case DRM_XE_MEM_REGION_CLASS_STOLEN: return "STOLEN";
     default:                             return "UNKNOWN";
     }
 }
@@ -49,68 +48,60 @@ int main(int argc, char **argv)
 
     printf("Opened %s\n", node);
 
-    /* Step 1: query size for MEM_REGIONS blob */
+    /* Query size of MEM_REGIONS */
     struct drm_xe_device_query query = {
-        .extensions = 0,
-        .query      = DRM_XE_DEVICE_QUERY_MEM_REGIONS,
-        .size       = 0,
-        .data       = 0,
+        .query = DRM_XE_DEVICE_QUERY_MEM_REGIONS,
+        .size  = 0,
+        .data  = 0,
     };
 
     if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &query) < 0)
-        die("DRM_IOCTL_XE_DEVICE_QUERY (size MEM_REGIONS)");
+        die("DRM_IOCTL_XE_DEVICE_QUERY (size)");
 
     if (query.size == 0) {
-        fprintf(stderr, "MEM_REGIONS query returned size=0\n");
-        close(fd);
+        fprintf(stderr, "Driver returned size=0 for MEM_REGIONS\n");
         return EXIT_FAILURE;
     }
 
-    /* Step 2: allocate and fetch full region info */
     struct drm_xe_query_mem_regions *mem = malloc(query.size);
     if (!mem)
-        die("malloc mem_regions");
+        die("malloc");
 
     memset(mem, 0, query.size);
     query.data = (uintptr_t)mem;
 
     if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &query) < 0)
-        die("DRM_IOCTL_XE_DEVICE_QUERY (MEM_REGIONS)");
+        die("DRM_IOCTL_XE_DEVICE_QUERY");
 
     printf("num_mem_regions = %u\n\n", mem->num_mem_regions);
 
-    uint32_t sysmem_min_page_size = 0;
+    uint32_t sysmem_min = 0;
 
     for (uint32_t i = 0; i < mem->num_mem_regions; i++) {
         struct drm_xe_mem_region *r = &mem->mem_regions[i];
 
-        const char *name = mem_class_name(r->mem_class);
-
         printf("Region %u:\n", i);
-        printf("  class        = %s (%u)\n", name, r->mem_class);
-        printf("  instance     = %u\n", r->instance);
-        printf("  min_page_size= %" PRIu64 " bytes\n",
-               (uint64_t)r->min_page_size);
-        printf("  usage        = 0x%" PRIx64 "\n",
-               (uint64_t)r->total_size);
-        printf("\n");
+        printf("  class         = %s (%u)\n",
+               mem_class_name(r->mem_class), r->mem_class);
+        printf("  instance      = %u\n", r->instance);
+        printf("  min_page_size = %" PRIu64 "\n", (uint64_t)r->min_page_size);
+        printf("  total_size    = %" PRIu64 "\n\n", (uint64_t)r->total_size);
 
         if (r->mem_class == DRM_XE_MEM_REGION_CLASS_SYSMEM) {
-            if (r->min_page_size > sysmem_min_page_size)
-                sysmem_min_page_size = (uint32_t)r->min_page_size;
+            if (r->min_page_size > sysmem_min)
+                sysmem_min = (uint32_t)r->min_page_size;
         }
     }
 
-    if (sysmem_min_page_size) {
-        printf("== SYSMEM effective min_page_size = %u bytes ==\n",
-               sysmem_min_page_size);
-        if (sysmem_min_page_size == 4096)
-            printf("Looks like 4K pages → 4K BO / range is fine here.\n");
+    if (sysmem_min > 0) {
+        printf("== Effective SYSMEM min_page_size = %u bytes ==\n", sysmem_min);
+
+        if (sysmem_min == 4096)
+            printf("OK: 4K alignment is fine here.\n");
         else
-            printf("Looks larger than 4K (e.g. 64K on LNL) → "
-                   "4K BO / range will cause -EINVAL on VM_BIND.\n");
+            printf("LARGE PAGE SIZE (e.g., 64K). 4K BO / bind.range will FAIL.\n");
     } else {
-        printf("No SYSMEM region reported by driver.\n");
+        printf("No SYSMEM region reported.\n");
     }
 
     free(mem);
