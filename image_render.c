@@ -13,7 +13,6 @@
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
-#include <drm/drm_fourcc.h>
 #include <drm/xe_drm.h>
 
 #include <xf86drm.h>
@@ -23,6 +22,7 @@
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
 
+/* Small batch buffer size */
 #define BO_SIZE        4096
 #define BIND_ADDRESS   0x1000000ull   /* arbitrary GPU VA, page aligned */
 
@@ -63,7 +63,8 @@ static void kms_cleanup(struct kms_state *kms)
         munmap(kms->map, kms->size);
 
     if (kms->handle) {
-        struct drm_mode_destroy_dumb dreq = {0};
+        struct drm_mode_destroy_dumb dreq;
+        memset(&dreq, 0, sizeof(dreq));
         dreq.handle = kms->handle;
         if (ioctl(kms->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq) < 0)
             perror("DRM_IOCTL_MODE_DESTROY_DUMB");
@@ -121,17 +122,20 @@ static int kms_init(struct kms_state *kms, const char *card_path)
 
     if (enc) {
         kms->crtc_id = enc->crtc_id;
+        drmModeFreeEncoder(enc);
     } else if (res->count_crtcs > 0) {
         kms->crtc_id = res->crtcs[0];
     } else {
         fprintf(stderr, "No usable CRTC found\n");
-        drmModeFreeEncoder(enc);
         drmModeFreeConnector(conn);
         drmModeFreeResources(res);
         goto err;
     }
 
-    drmModeFreeEncoder(enc);
+    printf("KMS: connector=%u crtc=%u mode=%s %dx%d\n",
+           kms->conn_id, kms->crtc_id, kms->mode.name,
+           kms->mode.hdisplay, kms->mode.vdisplay);
+
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
 
@@ -171,17 +175,20 @@ static int kms_init(struct kms_state *kms, const char *card_path)
 
     /* Simple gradient fill (CPU) */
     uint32_t *pixels = (uint32_t *)kms->map;
+    uint32_t stride32 = kms->pitch / 4;
+
     for (uint32_t y = 0; y < kms->mode.vdisplay; y++) {
         for (uint32_t x = 0; x < kms->mode.hdisplay; x++) {
             uint8_t r = (x * 255) / (kms->mode.hdisplay ? kms->mode.hdisplay : 1);
             uint8_t g = (y * 255) / (kms->mode.vdisplay ? kms->mode.vdisplay : 1);
             uint8_t b = 128;
-            pixels[y * (kms->pitch / 4) + x] =
-                (0xFFu << 24) | (r << 16) | (g << 8) | b; /* ARGB8888 */
+            /* ARGB8888 */
+            pixels[y * stride32 + x] =
+                (0xFFu << 24) | (r << 16) | (g << 8) | b;
         }
     }
 
-    /* Create framebuffer (non-AddFB2, no DRM_FORMAT_XRGB8888) */
+    /* Create framebuffer using classic AddFB (no DRM_FORMAT_ constants). */
     if (drmModeAddFB(kms->fd,
                      kms->mode.hdisplay,
                      kms->mode.vdisplay,
@@ -220,13 +227,13 @@ static int open_render_node(const char *path)
     int fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "Failed to open %s: %s\n", path, strerror(errno));
-        return -1;
     }
     return fd;
 }
 
 /*
  * Query engines and return first RENDER engine instance.
+ * Matches the older xe_drm.h layout with drm_xe_query_engines.
  */
 static struct drm_xe_engine_class_instance
 pick_render_engine(int fd)
@@ -264,6 +271,7 @@ pick_render_engine(int fd)
 
 /*
  * Query memory regions and return a placement mask for SYSMEM.
+ * Matches older xe_drm.h with drm_xe_query_mem_regions.
  */
 static uint32_t pick_sysmem_placement(int fd, uint32_t *min_page_size_out)
 {
@@ -324,6 +332,7 @@ static void reset_syncobj(int fd, uint32_t handle)
 {
     struct drm_syncobj_array array;
     memset(&array, 0, sizeof(array));
+
     array.handles = (uintptr_t)&handle;
     array.count_handles = 1;
 
@@ -347,12 +356,19 @@ static void wait_syncobj(int fd, uint32_t handle)
         die("DRM_IOCTL_SYNCOBJ_WAIT");
 }
 
+/*
+ * Run a single no-op batch on Xe using your older UAPI layout:
+ * - drm_xe_vm_create
+ * - drm_xe_gem_create
+ * - drm_xe_vm_bind (with embedded .bind)
+ * - drm_xe_exec_queue_create { width, num_placements, instances, vm_id, ... }
+ * - drm_xe_exec { exec_queue_id, num_syncs, syncs, address, num_batch_buffer }
+ */
 static void run_xe_noop(int fd)
 {
     /* 1) Create VM */
     struct drm_xe_vm_create vmc;
     memset(&vmc, 0, sizeof(vmc));
-    /* vmc.flags = 0; simple VM */
 
     if (ioctl(fd, DRM_IOCTL_XE_VM_CREATE, &vmc) < 0)
         die("DRM_IOCTL_XE_VM_CREATE");
@@ -371,10 +387,10 @@ static void run_xe_noop(int fd)
     /* 3) Create GEM buffer attached to this VM */
     struct drm_xe_gem_create gcreate;
     memset(&gcreate, 0, sizeof(gcreate));
-    gcreate.size      = BO_SIZE;
-    gcreate.placement = placement;
-    gcreate.vm_id     = vm_id;
-    /* flags, cpu_caching left as 0 / default */
+    gcreate.size        = BO_SIZE;
+    gcreate.placement   = placement;
+    gcreate.vm_id       = vm_id;
+    gcreate.cpu_caching = DRM_XE_GEM_CPU_CACHING_WB;
 
     if (ioctl(fd, DRM_IOCTL_XE_GEM_CREATE, &gcreate) < 0)
         die("DRM_IOCTL_XE_GEM_CREATE");
@@ -404,25 +420,23 @@ static void run_xe_noop(int fd)
     batch[1] = 0;   /* padding / NOOP */
 
     /* 6) Bind BO into the VM at BIND_ADDRESS (synchronous bind) */
-    struct drm_xe_vm_bind_op bop;
-    memset(&bop, 0, sizeof(bop));
-    bop.obj        = bo_handle;
-    bop.obj_offset = 0;
-    bop.range      = BO_SIZE;
-    bop.addr       = BIND_ADDRESS;
-    bop.tile_mask  = 0;
-    bop.op         = XE_VM_BIND_OP_MAP;   /* MAP operation */
-    bop.region     = 0;
-
     struct drm_xe_vm_bind bind;
     memset(&bind, 0, sizeof(bind));
+
     bind.vm_id         = vm_id;
-    bind.exec_queue_id = 0;   /* default VM bind engine */
+    bind.exec_queue_id = 0;  /* default VM-bind engine */
     bind.num_binds     = 1;
-    bind.bind          = bop; /* single bind op */
-    /* bind.flags = 0;     // synchronous bind (default) */
-    bind.num_syncs     = 0;
-    bind.syncs         = 0;
+
+    bind.bind.extensions  = 0;
+    bind.bind.obj         = bo_handle;
+    bind.bind.pat_index   = 0;        /* simple PAT */
+    bind.bind.obj_offset  = 0;
+    bind.bind.range       = BO_SIZE;
+    bind.bind.addr        = BIND_ADDRESS;
+    bind.bind.op          = DRM_XE_VM_BIND_OP_MAP;
+    bind.bind.flags       = 0;
+    bind.bind.prefetch_mem_region_instance = 0;
+    bind.bind.pad2        = 0;
 
     if (ioctl(fd, DRM_IOCTL_XE_VM_BIND, &bind) < 0)
         die("DRM_IOCTL_XE_VM_BIND");
@@ -430,19 +444,19 @@ static void run_xe_noop(int fd)
     printf("Xe: BO bound at VA 0x%llx\n",
            (unsigned long long)BIND_ADDRESS);
 
-    /* 7) Pick a RENDER engine instance */
+    /* 7) Pick a RENDER engine instance & create exec queue (old layout) */
     struct drm_xe_engine_class_instance inst = pick_render_engine(fd);
 
     printf("Xe: Using RENDER engine: class=%u instance=%u gt_id=%u\n",
            inst.engine_class, inst.engine_instance, inst.gt_id);
 
-    /* 8) Create exec queue for that engine + VM */
     struct drm_xe_exec_queue_create execq;
     memset(&execq, 0, sizeof(execq));
+
+    execq.width          = 1;
+    execq.num_placements = 1;
     execq.vm_id          = vm_id;
-    execq.num_bb_per_exec = 1;
-    execq.num_eng_per_bb  = 1;
-    execq.instances       = (uintptr_t)&inst;
+    execq.instances      = (uintptr_t)&inst;
 
     if (ioctl(fd, DRM_IOCTL_XE_EXEC_QUEUE_CREATE, &execq) < 0)
         die("DRM_IOCTL_XE_EXEC_QUEUE_CREATE");
@@ -450,7 +464,7 @@ static void run_xe_noop(int fd)
     uint32_t exec_queue_id = execq.exec_queue_id;
     printf("Xe: Exec queue created: id=%u\n", exec_queue_id);
 
-    /* 9) Create a syncobj to use as an out-fence */
+    /* 8) Create a syncobj for out-fence */
     uint32_t sync_handle = create_syncobj(fd);
 
     struct drm_xe_sync sync;
@@ -458,7 +472,7 @@ static void run_xe_noop(int fd)
     sync.type           = DRM_XE_SYNC_TYPE_SYNCOBJ;
     sync.flags          = DRM_XE_SYNC_FLAG_SIGNAL;  /* signal on completion */
     sync.handle         = sync_handle;
-    sync.timeline_value = 0;
+    sync.timeline_value = 0;                        /* not used by binary */
 
     struct drm_xe_exec exec;
     memset(&exec, 0, sizeof(exec));
@@ -468,7 +482,7 @@ static void run_xe_noop(int fd)
     exec.address          = BIND_ADDRESS;    /* GPU VA of batch */
     exec.num_batch_buffer = 1;
 
-    /* 10) Submit once, wait for completion */
+    /* 9) Submit once, wait for completion */
     reset_syncobj(fd, sync_handle);
 
     if (ioctl(fd, DRM_IOCTL_XE_EXEC, &exec) < 0)
@@ -478,9 +492,7 @@ static void run_xe_noop(int fd)
     printf("Xe: Batch executed successfully.\n");
 
     munmap(map, BO_SIZE);
-    /* For brevity we skip explicit destroy of queue/vm/bo/syncobj.
-     * Kernel will clean up on fd close.
-     */
+    /* We let the kernel clean up BO/VM/queue/syncobj on fd close. */
 }
 
 /* ================================ main ==================================== */
@@ -502,7 +514,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    printf("Display is set up, gradient is on screen.\n");
+    printf("Display is set up, gradient should be visible.\n");
 
     int xe_fd = open_render_node(render_node);
     if (xe_fd >= 0) {
@@ -510,7 +522,8 @@ int main(int argc, char **argv)
         run_xe_noop(xe_fd);
         close(xe_fd);
     } else {
-        fprintf(stderr, "Xe render node open failed, skipping Xe exec.\n");
+        fprintf(stderr, "Xe render node open failed (%s) – skipping Xe exec.\n",
+                strerror(errno));
     }
 
     printf("Sleeping for 10 seconds so you can see the image...\n");
