@@ -1,21 +1,27 @@
-#include <stdio.h>
-
 char ask_yes_or_quit(const char *question)
 {
     char c;
+    int attempts = 0;
 
     while (1) {
         printf("%s (y/q): ", question);
         fflush(stdout);
 
-        if (scanf(" %c", &c) != 1)
-            continue;
-
-        if (c == 'y' || c == 'Y')
+        if (scanf(" %c", &c) != 1) {
+            attempts++;
+        } else if (c == 'y' || c == 'Y') {
             return 'y';
-        if (c == 'q' || c == 'Q')
+        } else if (c == 'q' || c == 'Q') {
             return 'q';
+        } else {
+            attempts++;
+        }
 
-        printf("Invalid input. Try again.\n");
+        if (attempts >= 3) {
+            printf("Too many invalid attempts. Quitting.\n");
+            return 'q';
+        }
+
+        printf("Invalid input. Try again (%d/3).\n", attempts);
     }
 }
